@@ -14,6 +14,7 @@ from torch import nn
 from torch.cuda.amp.autocast_mode import autocast
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+import torch.nn.utils.prune as prune
 from torch.utils.data.sampler import WeightedRandomSampler
 from trainer.torch import DistributedSampler, DistributedSamplerWrapper
 from trainer.trainer_utils import get_optimizer, get_scheduler
@@ -25,12 +26,11 @@ from TTS.tts.layers.vits.discriminator import VitsDiscriminator
 from TTS.tts.layers.vits.networks import PosteriorEncoder, ResidualCouplingBlocks, TextEncoder
 from TTS.tts.layers.vits.stochastic_duration_predictor import StochasticDurationPredictor
 from TTS.tts.models.base_tts import BaseTTS
-from TTS.tts.utils.fairseq import rehash_fairseq_vits_checkpoint
 from TTS.tts.utils.helpers import generate_path, maximum_path, rand_segments, segment, sequence_mask
 from TTS.tts.utils.languages import LanguageManager
 from TTS.tts.utils.speakers import SpeakerManager
 from TTS.tts.utils.synthesis import synthesis
-from TTS.tts.utils.text.characters import BaseCharacters, BaseVocabulary, _characters, _pad, _phonemes, _punctuations
+from TTS.tts.utils.text.characters import BaseCharacters, _characters, _pad, _phonemes, _punctuations
 from TTS.tts.utils.text.tokenizer import TTSTokenizer
 from TTS.tts.utils.visual import plot_alignment
 from TTS.utils.io import load_fsspec
@@ -48,6 +48,8 @@ mel_basis = {}
 
 
 @torch.no_grad()
+
+
 def weights_reset(m: nn.Module):
     # check if the current module has reset_parameters and if it is reset the weight
     reset_parameters = getattr(m, "reset_parameters", None)
@@ -61,6 +63,12 @@ def get_module_weights_sum(mdl: nn.Module):
         if "weight" in name:
             value = w.data.sum().item()
             dict_sums[name] = value
+        if name.endswith("_orig"):
+            name = name.replace("_orig", "")
+        if name in state["model"]:
+            param.data = state["model"][name]
+        else:
+            print(f"Warning: {name} not found in checkpoint!")
     return dict_sums
 
 
@@ -562,6 +570,7 @@ class VitsArgs(Coqpit):
     resblock_dilation_sizes_decoder: List[List[int]] = field(default_factory=lambda: [[1, 3, 5], [1, 3, 5], [1, 3, 5]])
     upsample_rates_decoder: List[int] = field(default_factory=lambda: [8, 8, 2, 2])
     upsample_initial_channel_decoder: int = 512
+    # upsample_initial_channel_decoder: int = 128
     upsample_kernel_sizes_decoder: List[int] = field(default_factory=lambda: [16, 16, 4, 4])
     periods_multi_period_discriminator: List[int] = field(default_factory=lambda: [2, 3, 5, 7, 11])
     use_sdp: bool = True
@@ -1695,9 +1704,64 @@ class Vits(BaseTTS):
 
         return [VitsDiscriminatorLoss(self.config), VitsGeneratorLoss(self.config)]
 
+    def _prune_model(self, pruning_percentage):
+        """
+        Prune the model by setting a certain percentage of its smallest weights to zero.
+
+        Parameters:
+        - pruning_percentage (float): The percentage of weights to be pruned.
+        """
+        for module in self.modules():
+            # Check if the module has been pruned before
+            if hasattr(module, 'weight_orig'):
+                print("Module has been pruned previously. Skipping.")
+                continue
+            if hasattr(module, 'weight') and module.weight is not None:
+                prune.l1_unstructured(module, name='weight', amount=pruning_percentage)
+
+    def _handle_pruned_model_loading(self, checkpoint_state_dict):
+        """
+        Handle loading of weights into potentially pruned model.
+        """
+        own_state = self.state_dict()
+        missing_keys = []
+        unexpected_keys = []
+
+        for name, param in checkpoint_state_dict.items():
+            if name in own_state:
+                if isinstance(param, torch.nn.Parameter):
+                    # backwards compatibility for serialized parameters
+                    param = param.data
+                try:
+                    own_state[name].copy_(param)
+                except Exception as e:
+                    missing_keys.append(name)
+                    continue
+            elif name + "_orig" in own_state:
+                # Handle the case where the model is pruned but checkpoint is not
+                own_state[name + "_orig"].copy_(param)
+            else:
+                unexpected_keys.append(name)
+
+        return missing_keys, unexpected_keys
+
+    def diagnose_loading(self, state):
+        model_keys = set(self.state_dict().keys())
+        checkpoint_keys = set(state["model"].keys())
+
+        print("\nKeys in model but not in checkpoint:")
+        for key in model_keys - checkpoint_keys:
+            print(key)
+
+        print("\nKeys in checkpoint but not in model:")
+        for key in checkpoint_keys - model_keys:
+            print(key)
+
+        return model_keys, checkpoint_keys
+
     def load_checkpoint(
-        self, config, checkpoint_path, eval=False, strict=True, cache=False
-    ):  # pylint: disable=unused-argument, redefined-builtin
+            self, config, checkpoint_path, eval=False, strict=True, cache=False
+):  # pylint: disable=unused-argument, redefined-builtin
         """Load the model checkpoint and setup for training or inference"""
         state = load_fsspec(checkpoint_path, map_location=torch.device("cpu"), cache=cache)
         # compat band-aid for the pre-trained models to not use the encoder baked into the model
@@ -1723,50 +1787,38 @@ class Vits(BaseTTS):
         if eval:
             self.eval()
             assert not self.training
-
-    def load_fairseq_checkpoint(
-        self, config, checkpoint_dir, eval=False
-    ):  # pylint: disable=unused-argument, redefined-builtin
-        """Load VITS checkpoints released by fairseq here: https://github.com/facebookresearch/fairseq/tree/main/examples/mms
-        Performs some changes for compatibility.
-
-        Args:
-            config (Coqpit): 🐸TTS model config.
-            checkpoint_dir (str): Path to the checkpoint directory.
-            eval (bool, optional): Set to True for evaluation. Defaults to False.
-        """
-        import json
-
-        from TTS.tts.utils.text.cleaners import basic_cleaners
-
-        self.disc = None
-        # set paths
-        config_file = os.path.join(checkpoint_dir, "config.json")
-        checkpoint_file = os.path.join(checkpoint_dir, "G_100000.pth")
-        vocab_file = os.path.join(checkpoint_dir, "vocab.txt")
-        # set config params
-        with open(config_file, "r", encoding="utf-8") as file:
-            # Load the JSON data as a dictionary
-            config_org = json.load(file)
-        self.config.audio.sample_rate = config_org["data"]["sampling_rate"]
-        # self.config.add_blank = config['add_blank']
-        # set tokenizer
-        vocab = FairseqVocab(vocab_file)
-        self.text_encoder.emb = nn.Embedding(vocab.num_chars, config.model_args.hidden_channels)
-        self.tokenizer = TTSTokenizer(
-            use_phonemes=False,
-            text_cleaner=basic_cleaners,
-            characters=vocab,
-            phonemizer=None,
-            add_blank=config_org["data"]["add_blank"],
-            use_eos_bos=False,
-        )
-        # load fairseq checkpoint
-        new_chk = rehash_fairseq_vits_checkpoint(checkpoint_file)
-        self.load_state_dict(new_chk)
-        if eval:
-            self.eval()
-            assert not self.training
+    # def load_checkpoint(self, config, checkpoint_path, eval=False, strict=True, cache=False):
+    #     """Load the model checkpoint and setup for training or inference"""
+    #     state = load_fsspec(checkpoint_path, map_location=torch.device("cpu"), cache=cache)
+    #
+    #     # compat band-aid for the pre-trained models to not use the encoder baked into the model
+    #     # TODO: consider baking the speaker encoder into the model and call it from there.
+    #     # as it is probably easier for model distribution.
+    #     state["model"] = {k: v for k, v in state["model"].items() if "speaker_encoder" not in k}
+    #
+    #     if self.args.encoder_sample_rate is not None and eval:
+    #         # audio resampler is not used in inference time
+    #         self.audio_resampler = None
+    #
+    #     # handle fine-tuning from a checkpoint with additional speakers
+    #     if hasattr(self, "emb_g") and state["model"]["emb_g.weight"].shape != self.emb_g.weight.shape:
+    #         num_new_speakers = self.emb_g.weight.shape[0] - state["model"]["emb_g.weight"].shape[0]
+    #         print(f" > Loading checkpoint with {num_new_speakers} additional speakers.")
+    #         emb_g = state["model"]["emb_g.weight"]
+    #         new_row = torch.randn(num_new_speakers, emb_g.shape[1])
+    #         emb_g = torch.cat([emb_g, new_row], axis=0)
+    #         state["model"]["emb_g.weight"] = emb_g
+    #
+    #     # Detach all tensors in state dict
+    #     for key in state["model"]:
+    #         state["model"][key] = state["model"][key].detach()
+    #
+    #     # load the model weights
+    #     self.load_state_dict(state["model"], strict=strict)
+    #
+    #     if eval:
+    #         self.eval()
+    #         assert not self.training
 
     @staticmethod
     def init_from_config(config: "VitsConfig", samples: Union[List[List], List[Dict]] = None, verbose=True):
@@ -1814,7 +1866,7 @@ class Vits(BaseTTS):
         # rollback values
         _forward = self.forward
         disc = None
-        if hasattr(self, "disc"):
+        if hasattr(self, 'disc'):
             disc = self.disc
         training = self.training
 
@@ -1822,7 +1874,7 @@ class Vits(BaseTTS):
         self.disc = None
         self.eval()
 
-        def onnx_inference(text, text_lengths, scales, sid=None, langid=None):
+        def onnx_inference(text, text_lengths, scales, sid=None):
             noise_scale = scales[0]
             length_scale = scales[1]
             noise_scale_dp = scales[2]
@@ -1835,7 +1887,7 @@ class Vits(BaseTTS):
                     "x_lengths": text_lengths,
                     "d_vectors": None,
                     "speaker_ids": sid,
-                    "language_ids": langid,
+                    "language_ids": None,
                     "durations": None,
                 },
             )["model_outputs"]
@@ -1846,23 +1898,22 @@ class Vits(BaseTTS):
         dummy_input_length = 100
         sequences = torch.randint(low=0, high=self.args.num_chars, size=(1, dummy_input_length), dtype=torch.long)
         sequence_lengths = torch.LongTensor([sequences.size(1)])
-        speaker_id = None
-        language_id = None
+        sepaker_id = None
         if self.num_speakers > 1:
-            speaker_id = torch.LongTensor([0])
-        if self.num_languages > 0 and self.embedded_language_dim > 0:
-            language_id = torch.LongTensor([0])
+            sepaker_id = torch.LongTensor([0])
         scales = torch.FloatTensor([self.inference_noise_scale, self.length_scale, self.inference_noise_scale_dp])
-        dummy_input = (sequences, sequence_lengths, scales, speaker_id, language_id)
+        dummy_input = (sequences, sequence_lengths, scales, sepaker_id)
+        print(dummy_input)
 
         # export to ONNX
         torch.onnx.export(
             model=self,
             args=dummy_input,
             opset_version=15,
+            do_constant_folding=True,
             f=output_path,
             verbose=verbose,
-            input_names=["input", "input_lengths", "scales", "sid", "langid"],
+            input_names=["input", "input_lengths", "scales", "sid"],
             output_names=["output"],
             dynamic_axes={
                 "input": {0: "batch_size", 1: "phonemes"},
@@ -1875,28 +1926,61 @@ class Vits(BaseTTS):
         self.forward = _forward
         if training:
             self.train()
-        if not disc is None:
-            self.disc = disc
+        self.disc = disc
 
     def load_onnx(self, model_path: str, cuda=False):
         import onnxruntime as ort
 
-        providers = [
-            "CPUExecutionProvider"
-            if cuda is False
-            else ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"})
-        ]
-        sess_options = ort.SessionOptions()
+        # providers = ["CPUExecutionProvider" if cuda is False else "CUDAExecutionProvider"]
+        providers = ["CPUExecutionProvider" if cuda is False else ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"})]
+        # sess_options = ort.SessionOptions()
+        sess_opt = ort.SessionOptions()
+
+        # sess_opt.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+        sess_opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        #
+        # sess_opt.intra_op_num_threads = 2
+        # sess_opt.inter_op_num_threads = 3
+
         self.onnx_sess = ort.InferenceSession(
             model_path,
-            sess_options=sess_options,
+            sess_options=sess_opt,
             providers=providers,
         )
 
-    def inference_onnx(self, x, x_lengths=None, speaker_id=None, language_id=None):
-        """ONNX inference"""
+    # def inference_onnx(self, x, x_lengths=None, speaker_id=None):
+    #     """ONNX inference
+    #     """
+    # 
+    #     if isinstance(x, torch.Tensor):
+    #         x = x.cpu().numpy()
+    # 
+    #     if x_lengths is None:
+    #         x_lengths = np.array([x.shape[1]], dtype=np.int64)
+    # 
+    #     if isinstance(x_lengths, torch.Tensor):
+    #         x_lengths = x_lengths.cpu().numpy()
+    #     scales = np.array(
+    #         [self.inference_noise_scale, self.length_scale, self.inference_noise_scale_dp],
+    #         dtype=np.float32,
+    #     )
+    #     audio = self.onnx_sess.run(
+    #         ["output"],
+    #         {
+    #             "input": x,
+    #             "input_lengths": x_lengths,
+    #             "scales": scales,
+    #             "sid": torch.tensor([speaker_id]).cpu().numpy(),
+    #         },
+    #     )
+    #     return audio[0][0]
+
+    def inference_onnx(self, x, x_lengths=None):
+        """ONNX inference
+        """
 
         if isinstance(x, torch.Tensor):
+            print("it is!")
             x = x.cpu().numpy()
 
         if x_lengths is None:
@@ -1908,15 +1992,14 @@ class Vits(BaseTTS):
             [self.inference_noise_scale, self.length_scale, self.inference_noise_scale_dp],
             dtype=np.float32,
         )
-
+        print(scales)
         audio = self.onnx_sess.run(
             ["output"],
             {
                 "input": x,
                 "input_lengths": x_lengths,
                 "scales": scales,
-                "sid": None if speaker_id is None else torch.tensor([speaker_id]).cpu().numpy(),
-                "langid": None if language_id is None else torch.tensor([language_id]).cpu().numpy(),
+                "sid": None,
             },
         )
         return audio[0][0]
@@ -1973,23 +2056,3 @@ class VitsCharacters(BaseCharacters):
             is_unique=False,
             is_sorted=True,
         )
-
-
-class FairseqVocab(BaseVocabulary):
-    def __init__(self, vocab: str):
-        super(FairseqVocab).__init__()
-        self.vocab = vocab
-
-    @property
-    def vocab(self):
-        """Return the vocabulary dictionary."""
-        return self._vocab
-
-    @vocab.setter
-    def vocab(self, vocab_file):
-        with open(vocab_file, encoding="utf-8") as f:
-            self._vocab = [x.replace("\n", "") for x in f.readlines()]
-        self.blank = self._vocab[0]
-        self.pad = " "
-        self._char_to_id = {s: i for i, s in enumerate(self._vocab)}  # pylint: disable=unnecessary-comprehension
-        self._id_to_char = {i: s for i, s in enumerate(self._vocab)}  # pylint: disable=unnecessary-comprehension
